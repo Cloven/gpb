@@ -46,6 +46,7 @@
 
 %% Translators for without user-data
 -export([any_e_atom/1, any_d_atom/1, any_m_atom/2, any_v_atom/2]).
+-export([any_v_atom/1]).
 %% Translators for user-data
 -export([any_e_atom/2, any_d_atom/2, any_m_atom/3, any_v_atom/3]).
 %% Translators for user-data and op
@@ -90,6 +91,78 @@ parses_importing_file_test() ->
     [{{msg,'X'},_}, {{msg,'Y'},_}] = receive_filter_sort_msgs_defs().
 
 
+import_fetcher_test() ->
+    Master = self(),
+    ContentsX = iolist_to_binary(
+                  ["import \"Y.proto\";\n"
+                   "message X { required Y f1 = 1; }\n"]),
+    ContentsY = iolist_to_binary(
+                  ["message Y { required uint32 f1 = 1; }\n"]),
+    FileReadOpt = mk_fileop_opt([{read_file,
+                                  fun("X.proto") ->
+                                          Master ! {read,"X.proto"},
+                                          {ok, ContentsX};
+                                     ("Y.proto") ->
+                                          Master ! {read,"Y.proto"},
+                                          {ok, ContentsY}
+                                  end}]),
+    %% Importer returns `from_file'
+    ok = gpb_compile:file(
+           "X.proto",
+           [{import_fetcher, fun(F) -> Master ! {redir_to_file,F},
+                                       from_file
+                             end},
+            FileReadOpt, {i,"."}]),
+    [{redir_to_file,"X.proto"},
+     {read,"X.proto"},
+     {redir_to_file,"Y.proto"},
+     {read,"Y.proto"}] = flush_msgs(),
+
+    %% Importer returns contents
+    ok = gpb_compile:file(
+           "X.proto",
+           [{import_fetcher, fun(F) ->
+                                     Master ! {fetched,F},
+                                     {ok, binary_to_list(
+                                            case F of
+                                                "X.proto" -> ContentsX;
+                                                "Y.proto" -> ContentsY
+                                            end)}
+                             end},
+            FileReadOpt, {i,"."}]),
+    [{fetched,"X.proto"},
+     {fetched,"Y.proto"}] = flush_msgs(),
+
+    %% Importer returns error
+    {error,{fetcher_issue,"Y.proto",reason_for_y}} =
+        gpb_compile:file(
+          "X.proto",
+          [{import_fetcher, fun(F) ->
+                                    case F of
+                                        "X.proto" -> from_file;
+                                        "Y.proto" -> {error,reason_for_y}
+                                    end
+                            end},
+           FileReadOpt, {i,"."}]),
+
+    %% Make sure we've flushed every message, synchronously
+    ok = gpb_compile:string(x, binary_to_list(ContentsY),
+                            [mk_defs_probe_sender_opt(self()),
+                             mk_fileop_opt([])]),
+    [_|_] = receive_filter_sort_msgs_defs(),
+    flush_msgs(),
+    ok.
+
+
+
+flush_msgs() ->
+    receive
+        M ->
+             [M | flush_msgs()]
+    after 0 ->
+            []
+    end.
+
 parses_file_to_binary_test() ->
     Contents = <<"message Msg { required uint32 field1 = 1; }\n">>,
     {ok, 'X', Code, []} =
@@ -104,7 +177,8 @@ parses_file_to_binary_test() ->
 
 parses_file_to_msg_defs_test() ->
     Contents = <<"message Msg { required uint32 field1 = 1; }\n">>,
-    {ok, [{{msg,'Msg'},[#?gpb_field{}]}]=MsgDefs} =
+    {ok, [{{msg,'Msg'},[#?gpb_field{}]},
+          {{msg_containment,"X"},['Msg']}]=MsgDefs} =
         gpb_compile:file(
           "X.proto",
           [mk_fileop_opt([{read_file, fun(_) -> {ok, Contents} end}]),
@@ -137,11 +211,67 @@ parses_and_generates_good_code_also_for_empty_msgs_test() ->
     ?assertMatch({m1}, M:decode_msg(M:encode_msg({m1}), m1)),
     unload_code(M).
 
-parses_and_generates_good_code_for_epb_compatibility_test() ->
-    M = compile_iolist(["message m1 { }\n"]),
-    ?assertMatch(true, is_binary(M:encode({m1}))),
-    ?assertMatch({m1}, M:decode(m1, M:encode({m1}))),
-    unload_code(M).
+encoding_decoding_functions_for_epb_compatibility_test() ->
+    DefsM1 = "message m1 { required uint32 a = 1; }\n",
+    DefsNoMsgs = "enum ee { a = 0; }\n",
+    {error, Reason1, []} = compile_iolist_get_errors_or_warnings(
+                             DefsM1,
+                             [epb_compatibility, maps]),
+    true = is_list(gpb_compile:format_error(Reason1)),
+
+    %% Verify we get an error for epb_compatibility with a message named 'msg'
+    %% due to collision with standard gpb encode_msg/decode_msg functions
+    {error, Reason2, []} = compile_iolist_get_errors_or_warnings(
+                             "message msg { }\n",
+                             [epb_compatibility, maps]),
+    true = is_list(gpb_compile:format_error(Reason2)),
+
+    Mod1 = compile_iolist(DefsM1, [epb_compatibility]),
+    M1 = #m1{a=1234},
+    B1 = Mod1:encode(M1),
+    ?assertMatch(true, is_binary(B1)),
+    B1 = Mod1:encode_m1(M1),
+    M1 = Mod1:decode(m1, B1),
+    M1 = Mod1:decode_m1(B1),
+    unload_code(Mod1),
+
+    %% verify no compatibility functions generated with no compat options
+    Mod2 = compile_iolist(DefsM1, []),
+    ?assertError(undef, Mod2:encode(M1)),
+    ?assertError(undef, Mod2:encode_m1(M1)),
+    ?assertError(undef, Mod2:decode(m1, B1)),
+    ?assertError(undef, Mod2:decode_m1(B1)),
+    unload_code(Mod2),
+
+    %% verify functions generated ok when no msgs specified
+    Mod3 = compile_iolist(DefsNoMsgs, [epb_compatibility]),
+    _ = Mod3:module_info(),
+    unload_code(Mod3).
+
+epb_compatibility_opt_implies_pb_modsuffix_test() ->
+    Contents = <<"message m { required uint32 f = 1; }\n">>,
+    T = self(),
+    ok = gpb_compile:file(
+           "X.proto",
+           [mk_fileop_opt([{read_file, fun(_) -> {ok, Contents} end},
+                           {write_file, fun(Nm, _) -> T ! {file_name, Nm},
+                                                      ok
+                                        end}]),
+            {i,"."},
+            epb_compatibility]),
+    ["X_pb.erl", "X_pb.hrl"] =
+        lists:sort([receive {file_name, Nm1} -> Nm1 end,
+                    receive {file_name, Nm2} -> Nm2 end]).
+
+epb_compatibility_opt_implies_msg_name_to_lower_test() ->
+    Contents = <<"message SomeMsg { required uint32 f = 1; }\n">>,
+    ok = gpb_compile:file(
+           "X.proto",
+           [mk_fileop_opt([{read_file, fun(_) -> {ok, Contents} end}]),
+            mk_defs_probe_sender_opt(self()),
+            {i,"."},
+            epb_compatibility]),
+    [{{msg,somemsg},_}] = receive_filter_sort_msgs_defs().
 
 field_pass_as_params_test() ->
     MsgDef = ["message m2 { required uint32 f22 = 1; }"
@@ -247,7 +377,7 @@ code_generation_when_submsg_size_is_known_at_compile_time_test() ->
     unload_code(M2).
 
 code_generation_when_map_enum_size_is_unknown_at_compile_time_test() ->
-    %% calculation of whether e_varint is needed or not when only 
+    %% calculation of whether e_varint is needed or not when only
     %% an enum needs it, when that enum is in a map
     Defs = [{{msg,m1}, [#?gpb_field{name=a, type={map,bool,{enum,e1}},
                                     fnum=1, rnum=2, occurrence=repeated,
@@ -317,7 +447,7 @@ introspection_defs_as_proplists_test() ->
       {opts,       []}]] = PL = M:find_msg_def(msg1),
     [{{msg, msg1}, PL}] = M:get_msg_defs(),
     [s1, s2] = M:get_service_names(),
-    {{service, s1}, [[{name, req1}, {input, 'msg1'}, {output, 'msg1'}], 
+    {{service, s1}, [[{name, req1}, {input, 'msg1'}, {output, 'msg1'}],
                      [{name, req2}, {input, 'msg1'}, {output, 'msg1'}]]} = M:get_service_def(s1),
     {{service, s2}, [[{name, req2}, {input, 'msg1'}, {output, 'msg1'}]]} = M:get_service_def(s2),
     [{name, req1}, {input, 'msg1'}, {output, 'msg1'}] = M:find_rpc_def(s1, req1),
@@ -463,7 +593,7 @@ module_msg_name_prefix_test() ->
                            {msg_name_suffix, MsgSuffix}]),
     receive
         {read, "m.proto"} -> ok;
-        {read, X} -> erlang:error("reading from odd file", X)
+        {read, X} -> erlang:error({"reading from odd file", X})
     end,
     receive
         {write, {hrl, "mp_m_xp.hrl", Hrl}} ->
@@ -892,6 +1022,37 @@ verify_callback_for_Any_is_optional_test() ->
     ok = M:verify_msg({m,"not an atom"}),
     unload_code(M).
 
+verify_callback_with_and_without_errorf_test() ->
+    DefsM1 = ["syntax=\"proto3\";",
+              "import \"google/protobuf/any.proto\";",
+              "message m1 {",
+              "  required google.protobuf.Any a=1;",
+              "}"],
+
+    Mod1 = compile_iolist(
+             DefsM1,
+             [use_packages,
+              {any_translate,
+               [{encode,{?MODULE,any_e_atom,['$1']}},
+                {decode,{?MODULE,any_d_atom,['$1']}},
+                {verify,{?MODULE,any_v_atom,['$1','$errorf']}}]}]),
+    ok = Mod1:verify_msg(#m1{a=abc}),
+    ?assertError({gpb_type_error,{not_an_atom,[{value,123},{path,'m1.a'}]}},
+                 Mod1:verify_msg(#m1{a=123})),
+    unload_code(Mod1),
+
+    Mod2 = compile_iolist(
+             DefsM1,
+             [use_packages,
+              {any_translate,
+               [{encode,{?MODULE,any_e_atom,['$1']}},
+                {decode,{?MODULE,any_d_atom,['$1']}},
+                {verify,{?MODULE,any_v_atom,['$1']}}]}]), % no '$errorf'
+    ok = Mod2:verify_msg(#m1{a=abc}),
+    ?assertError({gpb_type_error,{oops_no_atom,[{value,123},{path,'m1.a'}]}},
+                 Mod2:verify_msg(#m1{a=123})),
+    unload_code(Mod2).
+
 %% Translators/callbacks:
 any_e_atom(A) ->
     {'google.protobuf.Any', "x.com/atom", list_to_binary(atom_to_list(A))}.
@@ -906,6 +1067,9 @@ any_v_atom(A, ErrorF) ->
     if is_atom(A) -> ok;
        true -> ErrorF(not_an_atom)
     end.
+
+any_v_atom(A) when is_atom(A) -> ok;
+any_v_atom(_) -> erlang:error(oops_no_atom).
 
 %% Translators/callbacks for user-data
 any_e_atom(A, Fn) -> call_tr_userdata_fn(Fn, any_e_atom(A)).
@@ -980,7 +1144,7 @@ report_or_return_warnings_or_errors_test_aux() ->
                                [report_errors, return_errors]],
         WarnsAsErrsOpts    <- [[], [warnings_as_errors]],
         CompileTo          <- [to_binary, to_file, to_proto_defs],
-        SrcType            <- [from_file, from_defs],
+        SrcType            <- [from_file, from_defs, from_string],
         SrcQuality         <- [clean_code, warningful_code, erroneous_code,
                                write_fails],
         %% Exclude a few combos
@@ -1120,7 +1284,11 @@ compile_the_code(Options, CompileTo, from_defs, SrcQuality) ->
 compile_the_code(Options, CompileTo, from_file, SrcQuality) ->
     compile_file_get_output(get_proto_file(SrcQuality),
                             compute_compile_opts(Options, CompileTo,
-                                                 SrcQuality)).
+                                                 SrcQuality));
+compile_the_code(Options, CompileTo, from_string, SrcQuality) ->
+    compile_string_get_output(get_proto_file(SrcQuality),
+                              compute_compile_opts(Options, CompileTo,
+                                                   SrcQuality)).
 
 get_proto_defs(clean_code) ->
     [{{msg,m1}, [#?gpb_field{name=field11, type=uint32, occurrence=optional,
@@ -1185,6 +1353,20 @@ compile_file_get_output(Txt, Opts) ->
     Opts2 = [FileOpOpts, {i,"."} | RestOpts],
     Opts3 = ensure_file_writing_stubbed_opt(Opts2),
     capture_stdout(fun() -> gpb_compile:file("X.proto", Opts3) end).
+
+compile_string_get_output(Txt, Opts) ->
+    Opts2 = case lists:member(fail_write, Opts) of
+                false ->
+                    Opts;
+                true ->
+                    RestOpts = Opts -- [fail_write],
+                    FOpt = mk_fileop_opt([{write_file,fun(_,_) -> {error,eacces}
+                                                      end}]),
+                    [FOpt | RestOpts]
+            end,
+    Opts3 = ensure_file_writing_stubbed_opt(Opts2),
+    Txt2 = binary_to_list(iolist_to_binary(Txt)),
+    capture_stdout(fun() -> gpb_compile:string('x', Txt2, Opts3) end).
 
 ensure_file_writing_stubbed_opt(Opts) ->
     case proplists:get_value(file_op, Opts) of
@@ -1657,9 +1839,17 @@ nif_encode_decode_mapfields(NEDM, Defs) ->
     ?assertEqual(OrigMsg, sort_all_fields(GMDecoded)),
     ?assertEqual(OrigMsg, sort_all_fields(MGDecoded)).
 
-usort_all_fields(R) -> map_all_fields(R, fun list:usort/1).
+usort_all_fields(R) -> map_all_fields(R, fun usort_by_mapkey/1).
 
-sort_all_fields(R) -> map_all_fields(R, fun list:sort/1).
+sort_all_fields(R) -> map_all_fields(R, fun lists:sort/1).
+
+usort_by_mapkey(L) ->
+    lists:sort(key_unique(L)).
+
+key_unique([{K,V} | Rest]) ->
+    [{K,V} | key_unique([X2 || {K2,_}=X2 <- Rest, K2 =/= K])];
+key_unique([]) ->
+    [].
 
 map_all_fields(R, Fn) ->
     [RName | Fields] = tuple_to_list(R),
@@ -2319,18 +2509,17 @@ mk_proto3_fields() ->
     TopMsgDef2 = {{msg, topmsg2}, mk_fields_of_type(
                                     EachType ++ [MsgType],
                                     repeated,
-                                    [{field_opts, [packed]}])},
+                                    [{field_opts_f, fun maybe_packed/1}])},
     OneofMsg1  = {{msg, oneof1},  mk_oneof_fields_of_type([fixed32], 1)},
-    MapMsg1    = {{msg, map1},    mk_map_fields_of_type([uint32], [string])},
     [{syntax, "proto3"},
      {proto3_msgs, [topmsg1,topmsg2,oneof1,map1,submsg1]},
-     EnumDef, SubMsgDef, TopMsgDef1, TopMsgDef2, OneofMsg1, MapMsg1].
+     EnumDef, SubMsgDef, TopMsgDef1, TopMsgDef2, OneofMsg1].
 
 mk_fields_of_type(Types, Occurrence) ->
     mk_fields_of_type(Types, Occurrence, []).
 
 mk_fields_of_type(Types, Occurrence, Opts) ->
-    FieldOpts = proplists:get_value(field_opts, Opts, []),
+    FieldOptsF = proplists:get_value(field_opts_f, Opts, fun(_) -> [] end),
     Offset = proplists:get_value(offset, Opts, 0),
     Types1 = [Type || Type <- Types, can_do_nif_type(Type)],
     [#?gpb_field{name=list_to_atom(lists:concat([f, I + Offset])),
@@ -2338,7 +2527,7 @@ mk_fields_of_type(Types, Occurrence, Opts) ->
                  fnum=I + Offset,
                  type=Type,
                  occurrence=Occurrence,
-                 opts=FieldOpts}
+                 opts=FieldOptsF(Type)}
      || {I, Type} <- index_seq(Types1)].
 
 mk_oneof_fields_of_type(Types, Pos) ->
@@ -2365,6 +2554,12 @@ mk_map_fields_of_type(KeyTypes, ValueTypes) ->
      || {I, F} <- index_seq(Fs1 ++ Fs2)].
 
 index_seq(L) -> lists:zip(lists:seq(1, length(L)), L).
+
+maybe_packed({msg,_})   -> [];
+maybe_packed({map,_,_}) -> [];
+maybe_packed(string)    -> [];
+maybe_packed(bytes)     -> [];
+maybe_packed(_)         -> [packed].
 
 can_do_nif_type(Type) ->
     if Type == int64;
@@ -2551,7 +2746,8 @@ opt_test() ->
            descriptor, maps,
            msg_name_to_lower,
            help, help, version, version,
-           {erlc_compile_options, "debug_info, inline_list_funcs"}
+           {erlc_compile_options, "debug_info, inline_list_funcs"},
+           epb_compatibility
            ],
           ["x.proto", "y.proto"]}} =
         gpb_compile:parse_opts_and_args(
@@ -2585,7 +2781,44 @@ opt_test() ->
            "-h", "--help",
            "-V", "--version",
            "-erlc_compile_options", "debug_info, inline_list_funcs",
+           "-epb",
            "x.proto", "y.proto"]).
+
+any_translation_options_test() ->
+    {ok, {[{any_translate,
+            [{encode, {me,fe,['$1']}},
+             {decode, {md,fd,['$1']}}]}],
+          ["x.proto"]}} =
+        gpb_compile:parse_opts_and_args(
+          ["-any_translate", "e=me:fe,d=md:fd",
+           "x.proto"]),
+    %% Merge
+    {ok, {[{any_translate,
+            [{encode, {me,fe,['$1']}},
+             {decode, {md,fd,['$1']}},
+             {merge,  {mm,fm,['$1','$2']}}]}],
+          ["x.proto"]}} =
+        gpb_compile:parse_opts_and_args(
+          ["-any_translate", "e=me:fe,d=md:fd,m=mm:fm",
+           "x.proto"]),
+    %% Verify
+    {ok, {[{any_translate,
+            [{encode, {me,fe,['$1']}},
+             {decode, {md,fd,['$1']}},
+             {verify, {mv,fv,['$1']}}]}],
+          ["x.proto"]}} =
+        gpb_compile:parse_opts_and_args(
+          ["-any_translate", "e=me:fe,d=md:fd,V=mv:fv",
+           "x.proto"]),
+    %% old style verify
+    {ok, {[{any_translate,
+            [{encode, {me,fe,['$1']}},
+             {decode, {md,fd,['$1']}},
+             {verify, {mv,fv,['$1','$errorf']}}]}],
+          ["x.proto"]}} =
+        gpb_compile:parse_opts_and_args(
+          ["-any_translate", "e=me:fe,d=md:fd,v=mv:fv",
+           "x.proto"]).
 
 %% --- auxiliaries -----------------
 
@@ -2657,17 +2890,20 @@ compile_iolist_maybe_errors_or_warnings(IoList, ExtraOpts, OnFail) ->
                             {read_file_info, ReadFileInfo},
                             {write_file, fun(_,_) -> ok end}]},
                  {i,"."},
-                 binary, return_warnings | ExtraOpts]),
+                 binary, return_errors, return_warnings | ExtraOpts]),
     case OnFail of
         must_succeed ->
-            {ok, Mod, Code, []} = CompRes,
-            load_code(Mod, Code),
-            Mod;
+            %% Mod1 instead of Mod, since some options can change the
+            %% module name (module_name_suffix, or epb_compatibility,
+            %% for instance)
+            {ok, Mod1, Code, []} = CompRes,
+            load_code(Mod1, Code),
+            Mod1;
         get_result ->
             case CompRes of
-                {ok, Mod, Code, Warnings} ->
-                    load_code(Mod, Code),
-                    {ok, Mod, Warnings};
+                {ok, Mod1, Code, Warnings} -> % Mod1 insead of Mod, see above
+                    load_code(Mod1, Code),
+                    {ok, Mod1, Warnings};
                 {error, Reasons, Warnings} ->
                     {error, Reasons, Warnings}
             end

@@ -144,13 +144,13 @@ msg_elem -> occurrence type fidentifier '=' dec_lit '[' opt_field_opts ']' ';':
                                                     fnum=literal_value('$5'),
                                                     opts='$7'}.
 msg_elem -> type fidentifier '=' dec_lit ';': % proto3
-                                        #?gpb_field{occurrence=required,
+                                        #?gpb_field{occurrence=optional,
                                                     type='$1',
                                                     name=identifier_name('$2'),
                                                     fnum=literal_value('$4'),
                                                     opts=[]}.
 msg_elem -> type fidentifier '=' dec_lit '[' opt_field_opts ']' ';': % proto3
-                                        #?gpb_field{occurrence=required,
+                                        #?gpb_field{occurrence=optional,
                                                     type='$1',
                                                     name=identifier_name('$2'),
                                                     fnum=literal_value('$4'),
@@ -381,13 +381,13 @@ post_process_one_file(Defs, Opts) ->
 post_process_all_files(Defs, Opts) ->
     case resolve_names(Defs) of
         {ok, Defs2} ->
-            {ok, handle_proto_syntax_version_all_files(
-                   possibly_prefix_suffix_msgs(
-                     normalize_msg_field_options(
-                       enumerate_msg_fields(
-                         reformat_names(
-                           extend_msgs(Defs2)))),
-                     Opts))};
+            {ok, normalize_msg_field_options(
+                   handle_proto_syntax_version_all_files(
+                     possibly_prefix_suffix_msgs(
+                         enumerate_msg_fields(
+                           reformat_names(
+                             extend_msgs(Defs2))),
+                       Opts)))};
         {error, Reasons} ->
             {error, Reasons}
     end.
@@ -689,35 +689,9 @@ handle_proto3_1(Defs) ->
     %% FIXME: Verify no 'required' occurrences
     %% FIXME: Verify enums start with 0
 
-    %% The protobuf language guide for proto3 says: "In proto3,
-    %% repeated fields of scalar numeric types use packed encoding by
-    %% default."
-    Defs1 = default_repeated_to_packed(Defs),
     %% Remember which msgs were defined using proto3 syntax,
     %% so we can treat them differently later on.
-    anno_msgs_proto3_origin(Defs1).
-
-default_repeated_to_packed([{{msg,MsgName},Fields} | Rest]) ->
-    NewDef = {{msg,MsgName}, default_repeated_fields_to_packed(Fields)},
-    [NewDef | default_repeated_to_packed(Rest)];
-default_repeated_to_packed([Other | Rest]) ->
-    [Other | default_repeated_to_packed(Rest)];
-default_repeated_to_packed([]) ->
-    [].
-
-default_repeated_fields_to_packed(Fields) ->
-    lists:map(fun(#?gpb_field{occurrence=repeated, opts=Opts}=F) ->
-                      case proplists:get_value(packed, Opts) of
-                          undefined ->
-                              NewOpts = [{packed, true} | Opts],
-                              F#?gpb_field{opts=NewOpts};
-                          _ ->
-                              F
-                      end;
-                 (F) ->
-                      F
-              end,
-              Fields).
+    anno_msgs_proto3_origin(Defs).
 
 anno_msgs_proto3_origin(Defs) ->
     anno_msgs_proto3_origin_2(Defs, []).
@@ -737,39 +711,59 @@ handle_proto_syntax_version_all_files(Defs) ->
             Proto3Msgs = lists:append([Msgs || {proto3_msgs,Msgs} <- P3Items]),
             Defs1 = Defs -- P3Items,
             Defs2 = Defs1 ++ [{proto3_msgs, lists:sort(Proto3Msgs)}],
-            %% The language guide says "For message fields, the
-            %% default value is null.", so making them optional ---
-            %% %% rather than default --- makes more sense.
-            make_proto3_submsg_fields_optional(Defs2, Proto3Msgs)
+
+            %% The protobuf language guide for proto3 says: "In proto3,
+            %% repeated fields of scalar numeric types use packed encoding by
+            %% default."
+            default_repeated_to_packed(Defs2, Proto3Msgs)
     end.
 
-make_proto3_submsg_fields_optional([Def | Rest], P3Msgs) ->
-    case Def of
-        {{msg,MsgName}, Fields} ->
-            case lists:member(MsgName, P3Msgs) of
-                true ->
-                    Fields1 =
-                        lists:map(
-                          fun(#?gpb_field{type={msg,_}, occurrence=Occ}=F) ->
-                                  case Occ of
-                                      repeated -> F; % don't change repeated
-                                      _ -> F#?gpb_field{occurrence=optional}
-                                  end;
-                             (OtherField) ->
-                                  OtherField
-                          end,
-                          Fields),
-                    Def1 = {{msg,MsgName}, Fields1},
-                    [Def1 | make_proto3_submsg_fields_optional(Rest, P3Msgs)];
-                false ->
-                    [Def | make_proto3_submsg_fields_optional(Rest, P3Msgs)]
-            end;
-        _ ->
-            [Def | make_proto3_submsg_fields_optional(Rest, P3Msgs)]
-    end;
-make_proto3_submsg_fields_optional([], _P3Msgs) ->
-    [].
+default_repeated_to_packed(Defs, P3Msgs) ->
+    lists:map(
+      fun({{msg,MsgName},Fields}=MsgDef) ->
+              case lists:member(MsgName, P3Msgs) of
+                  true ->
+                      Fields1 = default_repeated_fields_to_packed(Fields),
+                      {{msg,MsgName}, Fields1};
+                  false ->
+                      MsgDef
+              end;
+         (Other) ->
+              Other
+      end,
+      Defs).
 
+default_repeated_fields_to_packed(Fields) ->
+    lists:map(
+      fun(#?gpb_field{occurrence=repeated, opts=Opts, type=Type}=F) ->
+              case {proplists:get_value(packed, Opts),
+                    is_scalar_numeric(Type)} of
+                  {undefined, true} ->
+                      NewOpts = [{packed, true} | Opts],
+                      F#?gpb_field{opts=NewOpts};
+                  _ ->
+                      F
+              end;
+         (F) ->
+              F
+      end,
+      Fields).
+
+is_scalar_numeric(int32)    -> true;
+is_scalar_numeric(int64)    -> true;
+is_scalar_numeric(uint32)   -> true;
+is_scalar_numeric(uint64)   -> true;
+is_scalar_numeric(sint32)   -> true;
+is_scalar_numeric(sint64)   -> true;
+is_scalar_numeric(fixed32)  -> true;
+is_scalar_numeric(fixed64)  -> true;
+is_scalar_numeric(sfixed32) -> true;
+is_scalar_numeric(sfixed64) -> true;
+is_scalar_numeric(bool)     -> true;
+is_scalar_numeric(float)    -> true;
+is_scalar_numeric(double)   -> true;
+is_scalar_numeric({enum,_}) -> true;
+is_scalar_numeric(_)        -> false. % not: string | bytes | msg | map
 
 %% Find inconsistencies
 %%
@@ -935,6 +929,9 @@ fmt_err({{bad_binary_value, Default}, {Msg, Field}}) ->
 reformat_names(Defs) ->
     lists:map(fun({{msg,Name}, Fields}) ->
                       {{msg,reformat_name(Name)}, reformat_fields(Fields)};
+                 ({{msg_containment, ProtoName}, Msgs}) ->
+                      {{msg_containment,ProtoName},
+                       [reformat_name(N) || N <- Msgs]};
                  ({{enum,Name}, ENs}) ->
                       {{enum,reformat_name(Name)}, reformat_enum_opt_names(ENs)};
                  ({{extensions,Name}, Exts}) ->
@@ -1065,60 +1062,131 @@ opt_tuple_to_atom_if_defined_true(Opt, Opts) ->
 possibly_prefix_suffix_msgs(Defs, Opts) ->
     Prefix = proplists:get_value(msg_name_prefix, Opts, ""),
     Suffix = proplists:get_value(msg_name_suffix, Opts, ""),
-    ToLower = proplists:get_value(msg_name_to_lower, Opts, false),
+    ToLower = case proplists:get_value(msg_name_to_lower, Opts, false) of
+                  false ->
+                      false;
+                  true ->
+                      to_lower
+              end,
+    ToLowerOrSnake =
+        case proplists:get_value(msg_name_to_snake_case, Opts, ToLower) of
+            true ->
+                snake_case;
+            T ->
+                T
+        end,
 
-    if Prefix == "", Suffix == "", ToLower == false ->
+    if Prefix == "", Suffix == "", ToLowerOrSnake == false ->
             Defs;
        true ->
-            prefix_suffix_msgs(Prefix, Suffix, ToLower, Defs)
+            prefix_suffix_msgs(Prefix, Suffix, ToLowerOrSnake, Defs)
     end.
 
+find_proto(_, []) ->
+    undefined;
+find_proto(Name, [{{msg_containment, Proto}, Msgs} | Rest]) ->
+      case lists:member(Name, Msgs) of
+          true ->
+              Proto;
+          false ->
+              find_proto(Name, Rest)
+      end;
+find_proto(Name, [_ | Rest]) ->
+    find_proto(Name, Rest).
 
-prefix_suffix_msgs(Prefix, Suffix, ToLower, Defs) ->
+maybe_prefix_by_proto(Name, {by_proto, PrefixList}, Defs) ->
+    case find_proto(Name, Defs) of
+        undefined ->
+            "";
+        ProtoName ->
+            proplists:get_value(list_to_atom(ProtoName), PrefixList, "")
+    end;
+maybe_prefix_by_proto(_Name, Prefix, _Defs) ->
+    Prefix.
+
+prefix_suffix_msgs(Prefix, Suffix, ToLowerOrSnake, Defs) ->
     lists:map(fun({{msg,Name}, Fields}) ->
-                      {{msg,prefix_suffix_name(Prefix, Suffix, ToLower, Name)},
-                       prefix_suffix_fields(Prefix, Suffix, ToLower, Fields)};
+                      Prefix1 = maybe_prefix_by_proto(Name, Prefix, Defs),
+                      {{msg,prefix_suffix_name(Prefix1, Suffix,
+                                             ToLowerOrSnake, Name)},
+                        prefix_suffix_fields(Prefix, Suffix,
+                                             ToLowerOrSnake, Fields, Defs)};
                  ({{extensions,Name}, Exts}) ->
+                      Prefix1 = maybe_prefix_by_proto(Name, Prefix, Defs),
                       {{extensions,
-                        prefix_suffix_name(Prefix, Suffix, ToLower, Name)},
+                        prefix_suffix_name(Prefix1, Suffix,
+                                           ToLowerOrSnake, Name)},
                        Exts};
                  ({{service,Name}, RPCs}) ->
-                      {{service,maybe_tolower_name(Name, ToLower)},
-                       prefix_suffix_rpcs(Prefix, Suffix, ToLower, RPCs)};
+                      {{service, maybe_tolower_or_snake_name(Name,
+                                                             ToLowerOrSnake)},
+                        prefix_suffix_rpcs(Prefix, Suffix,
+                                           ToLowerOrSnake, RPCs, Defs)};
                  ({package,Name}) ->
-                      {package,maybe_tolower_name(Name,ToLower)};
+                      {package, maybe_tolower_or_snake_name(Name,
+                                                            ToLowerOrSnake)};
                  ({proto3_msgs,Names}) ->
                       {proto3_msgs,
-                       [prefix_suffix_name(Prefix, Suffix, ToLower, Name)
-                        || Name <- Names]};
+                       [begin
+                            Prefix1 = maybe_prefix_by_proto(Name, Prefix, Defs),
+                            prefix_suffix_name(Prefix1, Suffix,
+                                               ToLowerOrSnake, Name)
+                        end || Name <- Names]};
                  (OtherElem) ->
                       OtherElem
               end,
               Defs).
 
-prefix_suffix_fields(Prefix, Suffix, ToLower, Fields) ->
+prefix_suffix_fields(Prefix, Suffix, ToLowerOrSnake, Fields, Defs) ->
     lists:map(
       fun(#?gpb_field{type={msg,MsgName}}=F) ->
-              NewMsgName = prefix_suffix_name(Prefix, Suffix, ToLower, MsgName),
+              Prefix1 = maybe_prefix_by_proto(MsgName, Prefix, Defs),
+              NewMsgName = prefix_suffix_name(Prefix1, Suffix,
+                                              ToLowerOrSnake, MsgName),
               F#?gpb_field{type={msg,NewMsgName}};
+         (#?gpb_field{type={map,KeyType,{msg,MsgName}}}=F) ->
+              NewMsgName = prefix_suffix_name(Prefix, Suffix,
+                                              ToLowerOrSnake, MsgName),
+              F#?gpb_field{type={map,KeyType,{msg,NewMsgName}}};
+         (#gpb_oneof{fields=Fs}=F) ->
+              Fs2 = prefix_suffix_fields(Prefix, Suffix,
+                                         ToLowerOrSnake, Fs, Defs),
+              F#gpb_oneof{fields=Fs2};
          (#?gpb_field{}=F) ->
               F
       end,
       Fields).
 
-prefix_suffix_name(Prefix, Suffix, ToLower, Name) ->
-    Name1 = maybe_tolower_name(Name, ToLower),
+prefix_suffix_name(Prefix, Suffix, ToLowerOrSnake, Name) ->
+    Name1 = maybe_tolower_or_snake_name(Name, ToLowerOrSnake),
     Name2 = lists:concat([Prefix, Name1, Suffix]),
     list_to_atom(Name2).
 
-maybe_tolower_name(Name, false) -> Name;
-maybe_tolower_name(Name, true) ->
-    list_to_atom(string:to_lower(atom_to_list(Name))).
+maybe_tolower_or_snake_name(Name, false) -> Name;
+maybe_tolower_or_snake_name(Name, to_lower) ->
+    list_to_atom(string:to_lower(atom_to_list(Name)));
+maybe_tolower_or_snake_name(Name, snake_case) ->
+    NameString = atom_to_list(Name),
+    Snaked = lists:foldl(fun(RE, Snaking) ->
+                             re:replace(Snaking, RE, "\\1_\\2", [{return, list},
+                                                                 global])
+                         end, NameString, [%% uppercase followed by lowercase
+                                          "(.)([A-Z][a-z]+)",
+                                          %% any consecutive digits
+                                          "(.)([0-9]+)",
+                                          %% uppercase with lowercase
+                                          %% or digit before it
+                                          "([a-z0-9])([A-Z])"]),
+    list_to_atom(string:to_lower(Snaked)).
 
-prefix_suffix_rpcs(Prefix, Suffix, ToLower, RPCs) ->
+prefix_suffix_rpcs(Prefix, Suffix, ToLowerOrSnake, RPCs, Defs) ->
     lists:map(fun(#?gpb_rpc{name=RpcName, input=Arg, output=Return}) ->
-                      NewArg = prefix_suffix_name(Prefix, Suffix, ToLower, Arg),
-                      NewReturn = prefix_suffix_name(Prefix, Suffix, ToLower, Return),
+                      PrefixArg = maybe_prefix_by_proto(Arg, Prefix, Defs),
+                      PrefixReturn = maybe_prefix_by_proto(Return,Prefix,Defs),
+                      NewArg = prefix_suffix_name(PrefixArg, Suffix,
+                                                  ToLowerOrSnake, Arg),
+                      NewReturn = prefix_suffix_name(PrefixReturn, Suffix,
+                                                     ToLowerOrSnake, Return),
                       #?gpb_rpc{name=RpcName,
                                 input=NewArg,
                                 output=NewReturn}

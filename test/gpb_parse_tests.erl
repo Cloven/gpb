@@ -353,7 +353,7 @@ field_opt_normalization_test() ->
                  #?gpb_field{name=f5, opts=[]},
                  #?gpb_field{name=f6, opts=[deprecated]},
                  #?gpb_field{name=f7, opts=[packed, {default,true}]}]}] =
-        do_process_sort_defs(Defs).
+        do_process_sort_several_defs([Defs]).
 
 parses_empty_msg_field_options_test() ->
     {ok,Defs} = parse_lines(["message m1 { required uint32 f1=1 []; }"]),
@@ -611,7 +611,7 @@ proto3_no_occurrence_test() ->
     [{proto3_msgs,[m1]},
      {syntax,"proto3"},
      {{msg,m1},
-      [#?gpb_field{name=f1,fnum=1,occurrence=required},
+      [#?gpb_field{name=f1,fnum=1,occurrence=optional},
        #?gpb_field{name=f2,fnum=2,occurrence=repeated}]}] =
         do_process_sort_defs(Defs).
 
@@ -628,7 +628,7 @@ proto3_sub_msgs_gets_occurrence_optional_test() ->
       [#?gpb_field{name=f1,fnum=1,type={msg,s1},occurrence=optional},
        #?gpb_field{name=f2,fnum=2,type={msg,s1},occurrence=repeated}]},
      {{msg,s1},
-      [#?gpb_field{name=f1,fnum=1,type=uint32,occurrence=required}]}] =
+      [#?gpb_field{name=f1,fnum=1,type=uint32,occurrence=optional}]}] =
         do_process_sort_defs(Defs).
 
 proto3_no_repeated_are_packed_by_default_test() ->
@@ -647,6 +647,57 @@ proto3_no_repeated_are_packed_by_default_test() ->
        #?gpb_field{name=f4,fnum=4,occurrence=repeated,opts=[packed]},
        #?gpb_field{name=f5,fnum=5,occurrence=repeated,opts=[packed]}
       ]}] =
+        do_process_sort_defs(Defs).
+
+proto3_only_numeric_scalars_are_packed_test() ->
+    {ok,Defs} = parse_lines(["syntax=\"proto3\";",
+                             "message m1 {",
+                             "  repeated int32            i32  = 1;",
+                             "  repeated int64            i64  = 2;",
+                             "  repeated uint32           u32  = 3;",
+                             "  repeated uint64           u64  = 4;",
+                             "  repeated sint32           s32  = 5;",
+                             "  repeated sint64           s64  = 6;",
+                             "  repeated fixed32          f32  = 7;",
+                             "  repeated fixed64          f64  = 8;",
+                             "  repeated sfixed32         sf32 = 9;",
+                             "  repeated sfixed64         sf64 = 10;",
+                             "  repeated bool             bool = 11;",
+                             "  repeated float            fl   = 12;",
+                             "  repeated double           do   = 13;",
+                             "  repeated string           str  = 14;",
+                             "  repeated bytes            by   = 15;",
+                             "  repeated ee               ef   = 16;",
+                             "  repeated subm             subf = 17;",
+                             "  map<int32,int32>          mapf = 18;",
+                             "}",
+                             "message subm { string f1 = 1; }",
+                             "enum ee { e0 = 0; }"
+                            ]),
+    [{proto3_msgs,[m1,subm]},
+     {syntax,"proto3"},
+     {{enum,ee},_},
+     {{msg,m1},
+      [#?gpb_field{name=i32,  occurrence=repeated, opts=[packed]},
+       #?gpb_field{name=i64,  occurrence=repeated, opts=[packed]},
+       #?gpb_field{name=u32,  occurrence=repeated, opts=[packed]},
+       #?gpb_field{name=u64,  occurrence=repeated, opts=[packed]},
+       #?gpb_field{name=s32,  occurrence=repeated, opts=[packed]},
+       #?gpb_field{name=s64,  occurrence=repeated, opts=[packed]},
+       #?gpb_field{name=f32,  occurrence=repeated, opts=[packed]},
+       #?gpb_field{name=f64,  occurrence=repeated, opts=[packed]},
+       #?gpb_field{name=sf32, occurrence=repeated, opts=[packed]},
+       #?gpb_field{name=sf64, occurrence=repeated, opts=[packed]},
+       #?gpb_field{name=bool, occurrence=repeated, opts=[packed]},
+       #?gpb_field{name=fl,   occurrence=repeated, opts=[packed]},
+       #?gpb_field{name=do,   occurrence=repeated, opts=[packed]},
+       #?gpb_field{name=str,  occurrence=repeated, opts=[]},
+       #?gpb_field{name=by,   occurrence=repeated, opts=[]},
+       #?gpb_field{name=ef,   occurrence=repeated, opts=[packed]},
+       #?gpb_field{name=subf, occurrence=repeated, opts=[]},
+       #?gpb_field{name=mapf,                      opts=[]}
+      ]},
+     {{msg,subm},_}] =
         do_process_sort_defs(Defs).
 
 mixing_proto2_and_proto3_test() ->
@@ -715,6 +766,29 @@ can_prefix_record_names_test() ->
                  output=p_m2} %% ... and result msgs to be prefixed
       ]}] = do_process_sort_defs(Defs, [{msg_name_prefix, "p_"}]).
 
+can_prefix_record_names_by_proto_test() ->
+    {ok, Defs} = parse_lines(["enum    e1 {a=1; b=2;}",
+                              "message m1 {required e1 f1=1;}",
+                              "message m2 {required m1 f2=1;}",
+                              "service s1 {",
+                              "  rpc req(m1) returns (m2) {};",
+                              "}",
+                              "extend m1 { optional uint32 fm2=2; }"]),
+    Defs1 = [{{msg_containment, "proto1"}, [['.',m1]]},
+             {{msg_containment, "proto2"}, [['.',m2]]} | Defs],
+    [{{enum,e1},  [{a,1},{b,2}]}, %% not prefixed
+     {{msg,p1_m1}, [#?gpb_field{name=f1, type={enum,e1}}, #?gpb_field{name=fm2}]},
+     {{msg,p2_m2}, [#?gpb_field{type={msg,p1_m1}}]}, %% type is a msg: to be prefixed
+     {{msg_containment,"proto1"},[m1]},
+     {{msg_containment,"proto2"},[m2]},
+     {{service,s1}, %% not prefixed
+      [#?gpb_rpc{name=req,
+                 input=p1_m1,  %% both argument ...
+                 output=p2_m2} %% ... and result msgs to be prefixed
+      ]}] = do_process_sort_defs(Defs1, [{msg_name_prefix, {by_proto,
+                                                            [{proto1, "p1_"},
+                                                             {proto2, "p2_"}]}}]).
+
 can_suffix_record_names_test() ->
     {ok, Defs} = parse_lines(["enum    e1 {a=1; b=2;}",
                               "message m1 {required e1 f1=1;}",
@@ -747,6 +821,44 @@ can_tolower_record_names_test() ->
                  input=msg1,  %% both argument ...
                  output=msg2} %% .. and result msgs to be to-lower
       ]}] = do_process_sort_defs(Defs, [msg_name_to_lower]).
+
+can_tolower_record_names_with_oneof_test() ->
+    {ok, Defs} = parse_lines(["message Msg1 {",
+                              "  oneof u {",
+                              "    Msg1   a = 1;",
+                              "    uint32 b = 2;",
+                              "  }",
+                              "}"]),
+    [{{msg,msg1}, [#gpb_oneof{fields=[#?gpb_field{name=a,type={msg,msg1}},
+                                      #?gpb_field{name=b}]}]}] =
+        do_process_sort_defs(Defs, [msg_name_to_lower]).
+
+can_tolower_record_names_with_map_test() ->
+    {ok, Defs} = parse_lines(["message Msg1 {",
+                              "  required uint32 f = 1;",
+                              "}"
+                              "message Msg2 {"
+                              "  map<string,Msg1> m = 1;",
+                              "}"]),
+    [{{msg,msg1}, [#?gpb_field{}]},
+     {{msg,msg2}, [#?gpb_field{type={map,string,{msg,msg1}}}]}] =
+        do_process_sort_defs(Defs, [msg_name_to_lower]).
+
+can_to_snake_record_names_test() ->
+    {ok, Defs} = parse_lines(["message MsgName1 {required MsgName2   f1=1;}",
+                              "message MsgName2 {required uint32 g1=1;}",
+                              "service SvcName1 {",
+                              "  rpc req(MsgName1) returns (MsgName2) {};",
+                              "}",
+                              "extend MsgName1 { optional uint32 fm2=2; }"]),
+    [{{msg,msg_name_1}, [#?gpb_field{name=f1, type={msg,msg_name_2}},
+                   #?gpb_field{name=fm2}]},
+     {{msg,msg_name_2}, [#?gpb_field{name=g1}]},
+     {{service,svc_name_1},
+      [#?gpb_rpc{name=req,
+                 input=msg_name_1,  %% both argument ...
+                 output=msg_name_2} %% .. and result msgs to be to-lower
+      ]}] = do_process_sort_defs(Defs, [msg_name_to_snake_case]).
 
 can_tolower_record_names_with_packages_test() ->
     {ok, Defs} = parse_lines(["package Pkg1;",
